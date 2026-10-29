@@ -5,8 +5,15 @@
  * ships with raw API keys. Keys are stored as Cloudflare secrets.
  *
  * Routes:
- *   POST /chat  → Anthropic Messages API (streaming)
- *   POST /tts   → ElevenLabs TTS API
+ *   POST /chat                → Anthropic Messages API (streaming)
+ *   POST /tts                 → ElevenLabs TTS API
+ *   POST /transcribe-token    → AssemblyAI temporary token
+ *   POST /verify-access-code  → Confirms an access code and returns its owner's name
+ *
+ * Every route requires `Authorization: Bearer <access code>`. Access codes
+ * are personal (one per person) and stored in the CLICKY_USERS KV namespace
+ * as SHA-256 hashes, so the raw codes never sit in Cloudflare. Manage them
+ * with the scripts in worker/scripts/.
  */
 
 interface Env {
@@ -14,7 +21,18 @@ interface Env {
   ELEVENLABS_API_KEY: string;
   ELEVENLABS_VOICE_ID: string;
   ASSEMBLYAI_API_KEY: string;
+  CLICKY_USERS: KVNamespace;
 }
+
+/** Stored at `user:<sha256 of access code>` in the CLICKY_USERS namespace. */
+interface ClickyUserRecord {
+  name: string;
+  /** Max /chat requests per UTC day. null means unlimited. */
+  dailyChatRequestLimit: number | null;
+}
+
+/** Usage counters expire on their own so the namespace doesn't grow forever. */
+const USAGE_COUNTER_RETENTION_SECONDS = 60 * 60 * 24 * 45;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -25,7 +43,20 @@ export default {
     }
 
     try {
+      const authenticatedUser = await findUserForAccessCode(request, env);
+      if (!authenticatedUser) {
+        return jsonResponse({ error: "invalid_access_code" }, 401);
+      }
+
+      if (url.pathname === "/verify-access-code") {
+        return jsonResponse({ name: authenticatedUser.name }, 200);
+      }
+
       if (url.pathname === "/chat") {
+        const isWithinDailyLimit = await recordChatRequestIfWithinDailyLimit(authenticatedUser, env);
+        if (!isWithinDailyLimit) {
+          return jsonResponse({ error: "daily_limit_reached" }, 429);
+        }
         return await handleChat(request, env);
       }
 
@@ -47,6 +78,57 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 };
+
+function jsonResponse(body: unknown, status: number): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function findUserForAccessCode(request: Request, env: Env): Promise<ClickyUserRecord | null> {
+  const authorizationHeader = request.headers.get("authorization") ?? "";
+  const bearerPrefix = "Bearer ";
+  if (!authorizationHeader.startsWith(bearerPrefix)) {
+    return null;
+  }
+
+  const accessCode = authorizationHeader.slice(bearerPrefix.length).trim();
+  if (accessCode.length === 0) {
+    return null;
+  }
+
+  const accessCodeHash = await sha256Hex(accessCode);
+  return await env.CLICKY_USERS.get<ClickyUserRecord>(`user:${accessCodeHash}`, "json");
+}
+
+/**
+ * Counts this /chat request against the user's daily limit. Only /chat is
+ * counted because it's the expensive call (Claude with screenshots); TTS and
+ * transcription tokens always follow a chat turn.
+ *
+ * KV has no atomic increment, so two requests landing at the same instant can
+ * both read the same count. For a handful of family users that slack is fine.
+ */
+async function recordChatRequestIfWithinDailyLimit(user: ClickyUserRecord, env: Env): Promise<boolean> {
+  const todayInUTC = new Date().toISOString().slice(0, 10);
+  const usageCounterKey = `usage:${user.name}:${todayInUTC}`;
+  const chatRequestsSoFarToday = parseInt((await env.CLICKY_USERS.get(usageCounterKey)) ?? "0", 10);
+
+  if (user.dailyChatRequestLimit !== null && chatRequestsSoFarToday >= user.dailyChatRequestLimit) {
+    return false;
+  }
+
+  await env.CLICKY_USERS.put(usageCounterKey, String(chatRequestsSoFarToday + 1), {
+    expirationTtl: USAGE_COUNTER_RETENTION_SECONDS,
+  });
+  return true;
+}
 
 async function handleChat(request: Request, env: Env): Promise<Response> {
   const body = await request.text();

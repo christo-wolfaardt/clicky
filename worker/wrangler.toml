@@ -4,3 +4,10 @@ compatibility_date = "2024-01-01"
 
 [vars]
 ELEVENLABS_VOICE_ID = "kPzsL2i3teMYv0FxEYQ6"
+
+# Personal access codes and daily usage counters. Create the namespace once with
+#   npx wrangler kv namespace create CLICKY_USERS
+# and paste the id it prints below.
+[[kv_namespaces]]
+binding = "CLICKY_USERS"
+id = "PASTE_YOUR_KV_NAMESPACE_ID_HERE"

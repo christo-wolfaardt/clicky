@@ -59,16 +59,12 @@ final class CompanionManager: ObservableObject {
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
 
-    /// Base URL for the Cloudflare Worker proxy. All API requests route
-    /// through this so keys never ship in the app binary.
-    private static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
-
     private lazy var claudeAPI: ClaudeAPI = {
-        return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
+        return ClaudeAPI(proxyURL: "\(ClickyWorkerConnection.workerBaseURL)/chat", model: selectedModel)
     }()
 
     private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
-        return ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
+        return ElevenLabsTTSClient(proxyURL: "\(ClickyWorkerConnection.workerBaseURL)/tts")
     }()
 
     /// Conversation history so Claude remembers prior exchanges within a session.
@@ -137,6 +133,105 @@ final class CompanionManager: ObservableObject {
         set { UserDefaults.standard.set(newValue, forKey: "hasCompletedOnboarding") }
     }
 
+    // MARK: - Sign-In (personal access codes)
+
+    /// Who the Worker says the stored access code belongs to. nil means
+    /// signed out. Cached in UserDefaults so the panel shows the right state
+    /// instantly on launch; the code itself lives in the Keychain.
+    @Published private(set) var signedInUserName: String? = UserDefaults.standard.string(forKey: "signedInUserName")
+
+    var isSignedIn: Bool {
+        signedInUserName != nil
+    }
+
+    private enum AccessCodeVerificationResult {
+        case valid(userName: String)
+        case invalid
+        case workerUnreachable(reason: String)
+    }
+
+    private func verifyAccessCodeWithWorker(_ accessCode: String) async -> AccessCodeVerificationResult {
+        var request = URLRequest(url: URL(string: "\(ClickyWorkerConnection.workerBaseURL)/verify-access-code")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 15
+        request.setValue("Bearer \(accessCode)", forHTTPHeaderField: "Authorization")
+
+        do {
+            let (responseData, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+
+            if statusCode == 401 {
+                return .invalid
+            }
+
+            guard statusCode == 200,
+                  let responseJSON = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
+                  let userName = responseJSON["name"] as? String else {
+                return .workerUnreachable(reason: "The Clicky server answered with HTTP \(statusCode).")
+            }
+            return .valid(userName: userName)
+        } catch {
+            return .workerUnreachable(reason: "Couldn't reach the Clicky server. Check your internet connection.")
+        }
+    }
+
+    /// Checks the code with the Worker and stores it if valid. Returns a
+    /// message to show under the access code field, or nil on success.
+    func signIn(withAccessCode enteredAccessCode: String) async -> String? {
+        // Codes are generated in uppercase; accept them typed in any case.
+        let accessCode = enteredAccessCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !accessCode.isEmpty else {
+            return "Enter your access code."
+        }
+
+        switch await verifyAccessCodeWithWorker(accessCode) {
+        case .valid(let userName):
+            ClickyAccessCodeKeychainStore.saveAccessCode(accessCode)
+            setSignedInUserName(userName)
+            return nil
+        case .invalid:
+            return "That code isn't valid. Check it and try again."
+        case .workerUnreachable(let reason):
+            return reason
+        }
+    }
+
+    func signOut() {
+        ClickyAccessCodeKeychainStore.deleteAccessCode()
+        setSignedInUserName(nil)
+        // A different person may sign in next, so don't carry over context.
+        conversationHistory.removeAll()
+    }
+
+    private func setSignedInUserName(_ userName: String?) {
+        signedInUserName = userName
+        UserDefaults.standard.set(userName, forKey: "signedInUserName")
+    }
+
+    /// Re-checks the stored code on launch so a code revoked with
+    /// remove-user.mjs signs the person out. Being offline keeps them
+    /// signed in; requests will just fail until the network is back.
+    private func revalidateStoredAccessCode() {
+        guard let storedAccessCode = ClickyAccessCodeKeychainStore.readAccessCode() else {
+            if isSignedIn {
+                setSignedInUserName(nil)
+            }
+            return
+        }
+
+        Task {
+            switch await verifyAccessCodeWithWorker(storedAccessCode) {
+            case .valid(let userName):
+                setSignedInUserName(userName)
+            case .invalid:
+                print("🔑 Clicky: stored access code was revoked, signing out")
+                signOut()
+            case .workerUnreachable(let reason):
+                print("⚠️ Clicky: couldn't re-check access code: \(reason)")
+            }
+        }
+    }
+
     func start() {
         refreshAllPermissions()
         print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
@@ -144,6 +239,7 @@ final class CompanionManager: ObservableObject {
         bindVoiceStateObservation()
         bindAudioPowerLevel()
         bindShortcutTransitions()
+        revalidateStoredAccessCode()
         // Eagerly touch the Claude API so its TLS warmup handshake completes
         // well before the onboarding demo fires.
         _ = claudeAPI
@@ -420,6 +516,9 @@ final class CompanionManager: ObservableObject {
         switch transition {
         case .pressed:
             guard !buddyDictationManager.isDictationInProgress else { return }
+            // Every request needs an access code, so there's nothing to do
+            // until someone signs in from the menu bar panel.
+            guard isSignedIn else { return }
 
             // Cancel any pending transient hide so the overlay stays visible
             transientHideTask?.cancel()
@@ -643,14 +742,14 @@ final class CompanionManager: ObservableObject {
                         voiceState = .responding
                     } catch {
                         print("⚠️ ElevenLabs TTS error: \(error)")
-                        speakCreditsErrorFallback()
+                        speakErrorFallback(for: error)
                     }
                 }
             } catch is CancellationError {
                 // User spoke again — response was interrupted
             } catch {
                 print("⚠️ Companion response error: \(error)")
-                speakCreditsErrorFallback()
+                speakErrorFallback(for: error)
             }
 
             if !Task.isCancelled {
@@ -690,11 +789,18 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Speaks a hardcoded error message using macOS system TTS when API
-    /// credits run out. Uses NSSpeechSynthesizer so it works even when
-    /// ElevenLabs is down.
-    private func speakCreditsErrorFallback() {
-        let utterance = "Sorry, I couldn't reach my services. Check your API credits and internet connection, then try again."
+    /// Speaks an error message using macOS system TTS. Uses
+    /// NSSpeechSynthesizer so it works even when ElevenLabs is down.
+    private func speakErrorFallback(for error: Error) {
+        let utterance: String
+        if ClickyWorkerConnection.isInvalidAccessCodeError(error) {
+            signOut()
+            utterance = "Your access code isn't valid anymore. Open Clicky from the menu bar to sign in again."
+        } else if ClickyWorkerConnection.isDailyLimitReachedError(error) {
+            utterance = "You've reached today's Clicky limit. It resets tomorrow."
+        } else {
+            utterance = "Sorry, I couldn't reach my services. Check your API credits and internet connection, then try again."
+        }
         let synthesizer = NSSpeechSynthesizer()
         synthesizer.startSpeaking(utterance)
         voiceState = .responding

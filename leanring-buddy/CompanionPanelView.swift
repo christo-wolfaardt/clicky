@@ -12,6 +12,9 @@ import SwiftUI
 
 struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
+    @State private var accessCodeInput: String = ""
+    @State private var signInErrorMessage: String?
+    @State private var isCheckingAccessCode: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -20,42 +23,54 @@ struct CompanionPanelView: View {
                 .background(DS.Colors.borderSubtle)
                 .padding(.horizontal, 16)
 
-            permissionsCopySection
-                .padding(.top, 16)
-                .padding(.horizontal, 16)
+            if companionManager.isSignedIn {
+                permissionsCopySection
+                    .padding(.top, 16)
+                    .padding(.horizontal, 16)
 
-            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                    Spacer()
+                        .frame(height: 12)
+
+                    modelPickerRow
+                        .padding(.horizontal, 16)
+                }
+
+                if !companionManager.allPermissionsGranted {
+                    Spacer()
+                        .frame(height: 16)
+
+                    settingsSection
+                        .padding(.horizontal, 16)
+                }
+
+                if !companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                    Spacer()
+                        .frame(height: 16)
+
+                    startButton
+                        .padding(.horizontal, 16)
+                }
+
+                // Show Clicky toggle — hidden for now
+                // if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
+                //     Spacer()
+                //         .frame(height: 16)
+                //
+                //     showClickyCursorToggleRow
+                //         .padding(.horizontal, 16)
+                // }
+
                 Spacer()
                     .frame(height: 12)
 
-                modelPickerRow
+                signedInAccountRow
+                    .padding(.horizontal, 16)
+            } else {
+                signInSection
+                    .padding(.top, 16)
                     .padding(.horizontal, 16)
             }
-
-            if !companionManager.allPermissionsGranted {
-                Spacer()
-                    .frame(height: 16)
-
-                settingsSection
-                    .padding(.horizontal, 16)
-            }
-
-            if !companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-                Spacer()
-                    .frame(height: 16)
-
-                startButton
-                    .padding(.horizontal, 16)
-            }
-
-            // Show Clicky toggle — hidden for now
-            // if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-            //     Spacer()
-            //         .frame(height: 16)
-            //
-            //     showClickyCursorToggleRow
-            //         .padding(.horizontal, 16)
-            // }
 
             Spacer()
                 .frame(height: 12)
@@ -111,6 +126,107 @@ struct CompanionPanelView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
+    }
+
+    // MARK: - Sign In
+
+    private var isAccessCodeInputEmpty: Bool {
+        accessCodeInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var signInSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Sign in to Clicky")
+                .font(.system(size: 12, weight: .bold))
+                .foregroundColor(DS.Colors.textSecondary)
+
+            Text("Paste the personal access code you were given.")
+                .font(.system(size: 11))
+                .foregroundColor(DS.Colors.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            TextField("CLK-XXXXX-XXXXX-XXXXX-XXXXX", text: $accessCodeInput)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13, design: .monospaced))
+                .foregroundColor(DS.Colors.textPrimary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                        .fill(Color.white.opacity(0.08))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                )
+                .onSubmit { submitAccessCode() }
+
+            if let signInErrorMessage {
+                Text(signInErrorMessage)
+                    .font(.system(size: 11))
+                    .foregroundColor(Color(red: 0.9, green: 0.4, blue: 0.4))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Button(action: {
+                submitAccessCode()
+            }) {
+                Text(isCheckingAccessCode ? "Checking…" : "Sign In")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(DS.Colors.textOnAccent)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(
+                        RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
+                            .fill(isAccessCodeInputEmpty || isCheckingAccessCode
+                                  ? DS.Colors.accent.opacity(0.4)
+                                  : DS.Colors.accent)
+                    )
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+            .disabled(isAccessCodeInputEmpty || isCheckingAccessCode)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func submitAccessCode() {
+        guard !isAccessCodeInputEmpty, !isCheckingAccessCode else { return }
+        isCheckingAccessCode = true
+        signInErrorMessage = nil
+
+        Task { @MainActor in
+            let signInErrorMessageFromWorker = await companionManager.signIn(withAccessCode: accessCodeInput)
+            isCheckingAccessCode = false
+            signInErrorMessage = signInErrorMessageFromWorker
+            if signInErrorMessageFromWorker == nil {
+                accessCodeInput = ""
+            }
+        }
+    }
+
+    private var signedInAccountRow: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "person.crop.circle")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(DS.Colors.textTertiary)
+
+            Text("Signed in as \(companionManager.signedInUserName?.capitalized ?? "")")
+                .font(.system(size: 11))
+                .foregroundColor(DS.Colors.textTertiary)
+
+            Spacer()
+
+            Button(action: {
+                companionManager.signOut()
+            }) {
+                Text("Sign Out")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+        }
     }
 
     // MARK: - Permissions Copy
@@ -602,7 +718,8 @@ struct CompanionPanelView: View {
             .buttonStyle(.plain)
             .pointerCursor()
 
-            if companionManager.hasCompletedOnboarding {
+            // Replaying onboarding runs the pointing demo, which needs a signed-in Worker request
+            if companionManager.hasCompletedOnboarding && companionManager.isSignedIn {
                 Spacer()
 
                 Button(action: {

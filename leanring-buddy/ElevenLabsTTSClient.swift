@@ -35,6 +35,7 @@ final class ElevenLabsTTSClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("audio/mpeg", forHTTPHeaderField: "Accept")
+        ClickyWorkerConnection.addAccessCodeAuthorization(to: &request)
 
         let body: [String: Any] = [
             "text": text,

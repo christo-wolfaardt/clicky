@@ -7,7 +7,7 @@
 
 macOS menu bar companion app. Lives entirely in the macOS status bar (no dock icon, no main window). Clicking the menu bar icon opens a custom floating panel with companion voice controls. Uses push-to-talk (ctrl+option) to capture voice input, transcribes it via AssemblyAI streaming, and sends the transcript + a screenshot of the user's screen to Claude. Claude responds with text (streamed via SSE) and voice (ElevenLabs TTS). A blue cursor overlay can fly to and point at UI elements Claude references on any connected monitor.
 
-All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in the app.
+All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in the app. Each person signs in with a personal access code (stored in the macOS Keychain) that the Worker checks on every request, with an optional daily cap per person.
 
 ## Architecture
 
@@ -31,9 +31,13 @@ The app never calls external APIs directly. All requests go through a Cloudflare
 | `POST /chat` | `api.anthropic.com/v1/messages` | Claude vision + streaming chat |
 | `POST /tts` | `api.elevenlabs.io/v1/text-to-speech/{voiceId}` | ElevenLabs TTS audio |
 | `POST /transcribe-token` | `streaming.assemblyai.com/v3/token` | Fetches a short-lived (480s) AssemblyAI websocket token |
+| `POST /verify-access-code` | — | Confirms an access code and returns its owner's name (used by the sign-in screen) |
+
+Every route requires `Authorization: Bearer <access code>`. Codes live in the `CLICKY_USERS` KV namespace as SHA-256 hashes (`user:<hash>` → `{name, dailyChatRequestLimit}`, plus `username:<name>` → hash). Only `/chat` counts toward the daily limit (`usage:<name>:<UTC date>` counters). The Worker's own errors are `401 {"error":"invalid_access_code"}` and `429 {"error":"daily_limit_reached"}`; the app matches on the body because upstream providers also return 401/429.
 
 Worker secrets: `ANTHROPIC_API_KEY`, `ASSEMBLYAI_API_KEY`, `ELEVENLABS_API_KEY`
 Worker vars: `ELEVENLABS_VOICE_ID`
+Worker KV: `CLICKY_USERS`
 
 ### Key Architecture Decisions
 
@@ -52,9 +56,9 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | File | Lines | Purpose |
 |------|-------|---------|
 | `leanring_buddyApp.swift` | ~89 | Menu bar app entry point. Uses `@NSApplicationDelegateAdaptor` with `CompanionAppDelegate` which creates `MenuBarPanelManager` and starts `CompanionManager`. No main window — the app lives entirely in the status bar. |
-| `CompanionManager.swift` | ~883 | Central state machine. Owns dictation, shortcut monitoring, screen capture, Claude API, ElevenLabs TTS, and overlay management. Tracks voice state (idle/listening/processing/responding), conversation history, model selection, and cursor visibility. Coordinates the full push-to-talk → screenshot → Claude → TTS → pointing pipeline. |
+| `CompanionManager.swift` | ~1000 | Central state machine. Owns dictation, shortcut monitoring, screen capture, Claude API, ElevenLabs TTS, and overlay management. Tracks voice state (idle/listening/processing/responding), conversation history, model selection, and cursor visibility. Coordinates the full push-to-talk → screenshot → Claude → TTS → pointing pipeline. |
 | `MenuBarPanelManager.swift` | ~243 | NSStatusItem + custom NSPanel lifecycle. Creates the menu bar icon, manages the floating companion panel (show/hide/position), installs click-outside-to-dismiss monitor. |
-| `CompanionPanelView.swift` | ~667 | SwiftUI panel content for the menu bar dropdown. Shows companion status, push-to-talk instructions, model picker (Sonnet/Opus), permissions UI, and quit button. Dark aesthetic using `DS` design system. |
+| `CompanionPanelView.swift` | ~800 | SwiftUI panel content for the menu bar dropdown. Shows the access-code sign-in screen when signed out; otherwise companion status, push-to-talk instructions, model picker (Sonnet/Opus), permissions UI, signed-in account row with sign out, and quit button. Dark aesthetic using `DS` design system. |
 | `OverlayWindow.swift` | ~820 | Full-screen transparent overlay hosting the blue cursor, response text, waveform, and spinner. Handles cursor animation, element pointing with bezier arcs, multi-monitor coordinate mapping, and fade-out transitions. |
 | `CompanionResponseOverlay.swift` | ~217 | SwiftUI view for the response text bubble and waveform displayed next to the cursor in the overlay. |
 | `CompanionScreenCaptureUtility.swift` | ~132 | Multi-monitor screenshot capture using ScreenCaptureKit. Returns labeled image data for each connected display. |
@@ -71,8 +75,11 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | `ElementLocationDetector.swift` | ~335 | Detects UI element locations in screenshots for cursor pointing. |
 | `DesignSystem.swift` | ~880 | Design system tokens — colors, corner radii, shared styles. All UI references `DS.Colors`, `DS.CornerRadius`, etc. |
 | `WindowPositionManager.swift` | ~262 | Window placement logic, Screen Recording permission flow, and accessibility permission helpers. |
+| `ClickyWorkerConnection.swift` | ~40 | Worker base URL (single source), attaches the access code as a Bearer header, and recognises the Worker's invalid-code / daily-limit errors. |
+| `ClickyAccessCodeKeychainStore.swift` | ~60 | Reads, saves and deletes the signed-in person's access code in the macOS Keychain. |
 | `AppBundleConfiguration.swift` | ~28 | Runtime configuration reader for keys stored in the app bundle Info.plist. |
-| `worker/src/index.ts` | ~142 | Cloudflare Worker proxy. Three routes: `/chat` (Claude), `/tts` (ElevenLabs), `/transcribe-token` (AssemblyAI temp token). |
+| `worker/src/index.ts` | ~225 | Cloudflare Worker proxy. Access-code auth and daily limits, plus routes `/chat` (Claude), `/tts` (ElevenLabs), `/transcribe-token` (AssemblyAI temp token), `/verify-access-code`. |
+| `worker/scripts/*.mjs` | — | Access-code admin via wrangler: `add-user.mjs`, `remove-user.mjs`, `show-usage.mjs` (shared helpers in `clicky-kv.mjs`). |
 
 ## Build & Run
 
@@ -94,6 +101,9 @@ open leanring-buddy.xcodeproj
 cd worker
 npm install
 
+# One-time: create the access-code store, paste its id into wrangler.toml
+npx wrangler kv namespace create CLICKY_USERS
+
 # Add secrets
 npx wrangler secret put ANTHROPIC_API_KEY
 npx wrangler secret put ASSEMBLYAI_API_KEY
@@ -104,6 +114,12 @@ npx wrangler deploy
 
 # Local dev (create worker/.dev.vars with your keys)
 npx wrangler dev
+
+# Manage access codes (talks to the deployed KV)
+node scripts/add-user.mjs christo        # unlimited
+node scripts/add-user.mjs eben 50        # 50 Claude requests per UTC day
+node scripts/remove-user.mjs eben
+node scripts/show-usage.mjs
 ```
 
 ## Code Style & Conventions
