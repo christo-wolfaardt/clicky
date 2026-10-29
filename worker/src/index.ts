@@ -8,7 +8,7 @@
  *   POST /chat                → Anthropic Messages API (streaming)
  *   POST /tts                 → ElevenLabs TTS API
  *   POST /transcribe-token    → AssemblyAI temporary token
- *   POST /verify-access-code  → Confirms an access code and returns its owner's name
+ *   POST /verify-access-code  → Confirms an access code and returns its owner's name and allowed models
  *
  * Every route requires `Authorization: Bearer <access code>`. Access codes
  * are personal (one per person) and stored in the CLICKY_USERS KV namespace
@@ -29,6 +29,8 @@ interface ClickyUserRecord {
   name: string;
   /** Max /chat requests per UTC day. null means unlimited. */
   dailyChatRequestLimit: number | null;
+  /** Claude model IDs this person may use. null or missing means any model. */
+  allowedModels?: string[] | null;
 }
 
 /** Usage counters expire on their own so the namespace doesn't grow forever. */
@@ -49,15 +51,25 @@ export default {
       }
 
       if (url.pathname === "/verify-access-code") {
-        return jsonResponse({ name: authenticatedUser.name }, 200);
+        return jsonResponse(
+          { name: authenticatedUser.name, allowedModels: authenticatedUser.allowedModels ?? null },
+          200
+        );
       }
 
       if (url.pathname === "/chat") {
+        const chatRequestBody = await request.text();
+
+        // Checked before counting usage so a rejected request doesn't eat into the daily limit
+        if (!isRequestedModelAllowed(chatRequestBody, authenticatedUser)) {
+          return jsonResponse({ error: "model_not_allowed" }, 403);
+        }
+
         const isWithinDailyLimit = await recordChatRequestIfWithinDailyLimit(authenticatedUser, env);
         if (!isWithinDailyLimit) {
           return jsonResponse({ error: "daily_limit_reached" }, 429);
         }
-        return await handleChat(request, env);
+        return await handleChat(chatRequestBody, env);
       }
 
       if (url.pathname === "/tts") {
@@ -107,6 +119,19 @@ async function findUserForAccessCode(request: Request, env: Env): Promise<Clicky
   return await env.CLICKY_USERS.get<ClickyUserRecord>(`user:${accessCodeHash}`, "json");
 }
 
+function isRequestedModelAllowed(chatRequestBody: string, user: ClickyUserRecord): boolean {
+  if (!user.allowedModels) {
+    return true;
+  }
+
+  try {
+    const requestedModel = JSON.parse(chatRequestBody).model;
+    return typeof requestedModel === "string" && user.allowedModels.includes(requestedModel);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Counts this /chat request against the user's daily limit. Only /chat is
  * counted because it's the expensive call (Claude with screenshots); TTS and
@@ -130,9 +155,7 @@ async function recordChatRequestIfWithinDailyLimit(user: ClickyUserRecord, env: 
   return true;
 }
 
-async function handleChat(request: Request, env: Env): Promise<Response> {
-  const body = await request.text();
-
+async function handleChat(body: string, env: Env): Promise<Response> {
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {

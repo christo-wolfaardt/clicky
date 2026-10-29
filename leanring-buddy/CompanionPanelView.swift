@@ -12,6 +12,8 @@ import SwiftUI
 
 struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
+    // Pre-filled with the last server used, so signing back in only needs the code
+    @State private var serverAddressInput: String = ClickyWorkerConnection.workerBaseURL
     @State private var accessCodeInput: String = ""
     @State private var signInErrorMessage: String?
     @State private var isCheckingAccessCode: Bool = false
@@ -130,8 +132,27 @@ struct CompanionPanelView: View {
 
     // MARK: - Sign In
 
-    private var isAccessCodeInputEmpty: Bool {
-        accessCodeInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    private var isSignInInputIncomplete: Bool {
+        serverAddressInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || accessCodeInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func signInTextField(placeholder: String, text: Binding<String>) -> some View {
+        TextField(placeholder, text: text)
+            .textFieldStyle(.plain)
+            .font(.system(size: 13, design: .monospaced))
+            .foregroundColor(DS.Colors.textPrimary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                    .fill(Color.white.opacity(0.08))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+            )
+            .onSubmit { submitAccessCode() }
     }
 
     private var signInSection: some View {
@@ -140,26 +161,13 @@ struct CompanionPanelView: View {
                 .font(.system(size: 12, weight: .bold))
                 .foregroundColor(DS.Colors.textSecondary)
 
-            Text("Paste the personal access code you were given.")
+            Text("Enter the server address and personal access code you were given.")
                 .font(.system(size: 11))
                 .foregroundColor(DS.Colors.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            TextField("CLK-XXXXX-XXXXX-XXXXX-XXXXX", text: $accessCodeInput)
-                .textFieldStyle(.plain)
-                .font(.system(size: 13, design: .monospaced))
-                .foregroundColor(DS.Colors.textPrimary)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(
-                    RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
-                        .fill(Color.white.opacity(0.08))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
-                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-                )
-                .onSubmit { submitAccessCode() }
+            signInTextField(placeholder: "clicky-proxy.example.workers.dev", text: $serverAddressInput)
+            signInTextField(placeholder: "CLK-XXXXX-XXXXX-XXXXX-XXXXX", text: $accessCodeInput)
 
             if let signInErrorMessage {
                 Text(signInErrorMessage)
@@ -178,25 +186,28 @@ struct CompanionPanelView: View {
                     .padding(.vertical, 10)
                     .background(
                         RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
-                            .fill(isAccessCodeInputEmpty || isCheckingAccessCode
+                            .fill(isSignInInputIncomplete || isCheckingAccessCode
                                   ? DS.Colors.accent.opacity(0.4)
                                   : DS.Colors.accent)
                     )
             }
             .buttonStyle(.plain)
             .pointerCursor()
-            .disabled(isAccessCodeInputEmpty || isCheckingAccessCode)
+            .disabled(isSignInInputIncomplete || isCheckingAccessCode)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func submitAccessCode() {
-        guard !isAccessCodeInputEmpty, !isCheckingAccessCode else { return }
+        guard !isSignInInputIncomplete, !isCheckingAccessCode else { return }
         isCheckingAccessCode = true
         signInErrorMessage = nil
 
         Task { @MainActor in
-            let signInErrorMessageFromWorker = await companionManager.signIn(withAccessCode: accessCodeInput)
+            let signInErrorMessageFromWorker = await companionManager.signIn(
+                withServerAddress: serverAddressInput,
+                accessCode: accessCodeInput
+            )
             isCheckingAccessCode = false
             signInErrorMessage = signInErrorMessageFromWorker
             if signInErrorMessageFromWorker == nil {
@@ -665,9 +676,14 @@ struct CompanionPanelView: View {
 
             Spacer()
 
+            // Only offer models the server allows for this person
             HStack(spacing: 0) {
-                modelOptionButton(label: "Sonnet", modelID: "claude-sonnet-4-6")
-                modelOptionButton(label: "Opus", modelID: "claude-opus-4-6")
+                if companionManager.isModelAllowedForSignedInUser("claude-sonnet-4-6") {
+                    modelOptionButton(label: "Sonnet", modelID: "claude-sonnet-4-6")
+                }
+                if companionManager.isModelAllowedForSignedInUser("claude-opus-4-6") {
+                    modelOptionButton(label: "Opus", modelID: "claude-opus-4-6")
+                }
             }
             .background(
                 RoundedRectangle(cornerRadius: 6, style: .continuous)

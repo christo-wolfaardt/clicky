@@ -48,11 +48,6 @@ final class CompanionManager: ObservableObject {
     @Published var onboardingPromptOpacity: Double = 0.0
     @Published var showOnboardingPrompt: Bool = false
 
-    // MARK: - Onboarding Music
-
-    private var onboardingMusicPlayer: AVAudioPlayer?
-    private var onboardingMusicFadeTimer: Timer?
-
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
@@ -98,6 +93,7 @@ final class CompanionManager: ObservableObject {
     @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-sonnet-4-6"
 
     func setSelectedModel(_ model: String) {
+        guard isModelAllowedForSignedInUser(model) else { return }
         selectedModel = model
         UserDefaults.standard.set(model, forKey: "selectedClaudeModel")
         claudeAPI.model = model
@@ -144,14 +140,24 @@ final class CompanionManager: ObservableObject {
         signedInUserName != nil
     }
 
+    /// Claude model IDs the server allows for this person (e.g. Sonnet only
+    /// for the kids). nil means any model. The server enforces this too;
+    /// the app uses it to hide models that would just be rejected.
+    @Published private(set) var allowedModelIDsForSignedInUser: [String]? = UserDefaults.standard.stringArray(forKey: "signedInAllowedModelIDs")
+
+    func isModelAllowedForSignedInUser(_ modelID: String) -> Bool {
+        guard let allowedModelIDsForSignedInUser else { return true }
+        return allowedModelIDsForSignedInUser.contains(modelID)
+    }
+
     private enum AccessCodeVerificationResult {
-        case valid(userName: String)
+        case valid(userName: String, allowedModelIDs: [String]?)
         case invalid
         case workerUnreachable(reason: String)
     }
 
-    private func verifyAccessCodeWithWorker(_ accessCode: String) async -> AccessCodeVerificationResult {
-        var request = URLRequest(url: URL(string: "\(ClickyWorkerConnection.workerBaseURL)/verify-access-code")!)
+    private func verifyAccessCodeWithWorker(serverAddress: String, accessCode: String) async -> AccessCodeVerificationResult {
+        var request = URLRequest(url: URL(string: "\(serverAddress)/verify-access-code")!)
         request.httpMethod = "POST"
         request.timeoutInterval = 15
         request.setValue("Bearer \(accessCode)", forHTTPHeaderField: "Authorization")
@@ -167,27 +173,35 @@ final class CompanionManager: ObservableObject {
             guard statusCode == 200,
                   let responseJSON = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
                   let userName = responseJSON["name"] as? String else {
-                return .workerUnreachable(reason: "The Clicky server answered with HTTP \(statusCode).")
+                return .workerUnreachable(reason: "That server didn't answer like a Clicky server (HTTP \(statusCode)). Check the address.")
             }
-            return .valid(userName: userName)
+            let allowedModelIDs = responseJSON["allowedModels"] as? [String]
+            return .valid(userName: userName, allowedModelIDs: allowedModelIDs)
         } catch {
-            return .workerUnreachable(reason: "Couldn't reach the Clicky server. Check your internet connection.")
+            return .workerUnreachable(reason: "Couldn't reach that server. Check the address and your internet connection.")
         }
     }
 
-    /// Checks the code with the Worker and stores it if valid. Returns a
-    /// message to show under the access code field, or nil on success.
-    func signIn(withAccessCode enteredAccessCode: String) async -> String? {
+    /// Checks the code with the given server and stores both if valid.
+    /// Returns a message to show on the sign-in screen, or nil on success.
+    func signIn(withServerAddress enteredServerAddress: String, accessCode enteredAccessCode: String) async -> String? {
+        guard let serverAddress = ClickyWorkerConnection.normalizedServerAddress(from: enteredServerAddress) else {
+            return "Enter the server address you were given, like https://clicky-proxy.example.workers.dev"
+        }
+
         // Codes are generated in uppercase; accept them typed in any case.
         let accessCode = enteredAccessCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         guard !accessCode.isEmpty else {
             return "Enter your access code."
         }
 
-        switch await verifyAccessCodeWithWorker(accessCode) {
-        case .valid(let userName):
+        switch await verifyAccessCodeWithWorker(serverAddress: serverAddress, accessCode: accessCode) {
+        case .valid(let userName, let allowedModelIDs):
+            ClickyWorkerConnection.saveServerAddress(serverAddress)
             ClickyAccessCodeKeychainStore.saveAccessCode(accessCode)
+            rebuildWorkerClientsForCurrentServerAddress()
             setSignedInUserName(userName)
+            setAllowedModelIDsForSignedInUser(allowedModelIDs)
             return nil
         case .invalid:
             return "That code isn't valid. Check it and try again."
@@ -199,6 +213,7 @@ final class CompanionManager: ObservableObject {
     func signOut() {
         ClickyAccessCodeKeychainStore.deleteAccessCode()
         setSignedInUserName(nil)
+        setAllowedModelIDsForSignedInUser(nil)
         // A different person may sign in next, so don't carry over context.
         conversationHistory.removeAll()
     }
@@ -208,11 +223,30 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(userName, forKey: "signedInUserName")
     }
 
+    /// Also moves the selected model onto an allowed one, so a restricted
+    /// person never sends a request the server will refuse.
+    private func setAllowedModelIDsForSignedInUser(_ allowedModelIDs: [String]?) {
+        allowedModelIDsForSignedInUser = allowedModelIDs
+        UserDefaults.standard.set(allowedModelIDs, forKey: "signedInAllowedModelIDs")
+
+        if let firstAllowedModelID = allowedModelIDs?.first, !isModelAllowedForSignedInUser(selectedModel) {
+            setSelectedModel(firstAllowedModelID)
+        }
+    }
+
+    /// The Claude and TTS clients capture their URL when created, so they're
+    /// recreated whenever the server address changes at sign-in.
+    private func rebuildWorkerClientsForCurrentServerAddress() {
+        claudeAPI = ClaudeAPI(proxyURL: "\(ClickyWorkerConnection.workerBaseURL)/chat", model: selectedModel)
+        elevenLabsTTSClient = ElevenLabsTTSClient(proxyURL: "\(ClickyWorkerConnection.workerBaseURL)/tts")
+    }
+
     /// Re-checks the stored code on launch so a code revoked with
     /// remove-user.mjs signs the person out. Being offline keeps them
     /// signed in; requests will just fail until the network is back.
     private func revalidateStoredAccessCode() {
-        guard let storedAccessCode = ClickyAccessCodeKeychainStore.readAccessCode() else {
+        guard let storedAccessCode = ClickyAccessCodeKeychainStore.readAccessCode(),
+              !ClickyWorkerConnection.workerBaseURL.isEmpty else {
             if isSignedIn {
                 setSignedInUserName(nil)
             }
@@ -220,9 +254,10 @@ final class CompanionManager: ObservableObject {
         }
 
         Task {
-            switch await verifyAccessCodeWithWorker(storedAccessCode) {
-            case .valid(let userName):
+            switch await verifyAccessCodeWithWorker(serverAddress: ClickyWorkerConnection.workerBaseURL, accessCode: storedAccessCode) {
+            case .valid(let userName, let allowedModelIDs):
                 setSignedInUserName(userName)
+                setAllowedModelIDsForSignedInUser(allowedModelIDs)
             case .invalid:
                 print("🔑 Clicky: stored access code was revoked, signing out")
                 signOut()
@@ -258,7 +293,7 @@ final class CompanionManager: ObservableObject {
     /// Called by BlueCursorView after the buddy finishes its pointing
     /// animation and returns to cursor-following mode.
     /// Triggers the onboarding sequence — dismisses the panel and restarts
-    /// the overlay so the welcome animation and intro video play.
+    /// the overlay so the welcome animation and pointing demo play.
     func triggerOnboarding() {
         // Post notification so the panel manager can dismiss the panel
         NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
@@ -267,11 +302,8 @@ final class CompanionManager: ObservableObject {
         // again on future launches — the cursor will auto-show instead
         hasCompletedOnboarding = true
 
-        // Play Besaid theme at 60% volume, fade out after 1m 30s
-        startOnboardingMusic()
-
         // Show the overlay for the first time — isFirstAppearance triggers
-        // the welcome animation and onboarding video
+        // the welcome animation and onboarding demo
         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
         isOverlayVisible = true
     }
@@ -281,62 +313,10 @@ final class CompanionManager: ObservableObject {
     /// is already visible so we just restart the welcome animation and demo.
     func replayOnboarding() {
         NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
-        startOnboardingMusic()
         // Tear down any existing overlays and recreate with isFirstAppearance = true
         overlayWindowManager.hasShownOverlayBefore = false
         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
         isOverlayVisible = true
-    }
-
-    private func stopOnboardingMusic() {
-        onboardingMusicFadeTimer?.invalidate()
-        onboardingMusicFadeTimer = nil
-        onboardingMusicPlayer?.stop()
-        onboardingMusicPlayer = nil
-    }
-
-    private func startOnboardingMusic() {
-        stopOnboardingMusic()
-        guard let musicURL = Bundle.main.url(forResource: "ff", withExtension: "mp3") else {
-            print("⚠️ Clicky: ff.mp3 not found in bundle")
-            return
-        }
-
-        do {
-            let player = try AVAudioPlayer(contentsOf: musicURL)
-            player.volume = 0.3
-            player.play()
-            self.onboardingMusicPlayer = player
-
-            // After 1m 30s, fade the music out over 3s
-            onboardingMusicFadeTimer = Timer.scheduledTimer(withTimeInterval: 90.0, repeats: false) { [weak self] _ in
-                self?.fadeOutOnboardingMusic()
-            }
-        } catch {
-            print("⚠️ Clicky: Failed to play onboarding music: \(error)")
-        }
-    }
-
-    private func fadeOutOnboardingMusic() {
-        guard let player = onboardingMusicPlayer else { return }
-
-        let fadeSteps = 30
-        let fadeDuration: Double = 3.0
-        let stepInterval = fadeDuration / Double(fadeSteps)
-        let volumeDecrement = player.volume / Float(fadeSteps)
-        var stepsRemaining = fadeSteps
-
-        onboardingMusicFadeTimer = Timer.scheduledTimer(withTimeInterval: stepInterval, repeats: true) { [weak self] timer in
-            stepsRemaining -= 1
-            player.volume -= volumeDecrement
-
-            if stepsRemaining <= 0 {
-                timer.invalidate()
-                player.stop()
-                self?.onboardingMusicPlayer = nil
-                self?.onboardingMusicFadeTimer = nil
-            }
-        }
     }
 
     func clearDetectedElementLocation() {
@@ -798,6 +778,8 @@ final class CompanionManager: ObservableObject {
             utterance = "Your access code isn't valid anymore. Open Clicky from the menu bar to sign in again."
         } else if ClickyWorkerConnection.isDailyLimitReachedError(error) {
             utterance = "You've reached today's Clicky limit. It resets tomorrow."
+        } else if ClickyWorkerConnection.isModelNotAllowedError(error) {
+            utterance = "That model isn't available on your account. Pick another one in the Clicky menu."
         } else {
             utterance = "Sorry, I couldn't reach my services. Check your API credits and internet connection, then try again."
         }
