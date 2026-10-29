@@ -12,11 +12,16 @@ import SwiftUI
 
 struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
+    @State private var selectedSignInMode: ClickyConnectionMode = ClickyServiceConnection.connectionMode
     // Pre-filled with the last server used, so signing back in only needs the code
-    @State private var serverAddressInput: String = ClickyWorkerConnection.workerBaseURL
+    @State private var serverAddressInput: String = ClickyServiceConnection.workerBaseURL
     @State private var accessCodeInput: String = ""
+    @State private var anthropicAPIKeyInput: String = ""
+    @State private var assemblyAIAPIKeyInput: String = ""
+    @State private var elevenLabsAPIKeyInput: String = ""
+    @State private var elevenLabsVoiceIDInput: String = ClickyServiceConnection.ownElevenLabsVoiceID
     @State private var signInErrorMessage: String?
-    @State private var isCheckingAccessCode: Bool = false
+    @State private var isCheckingSignIn: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -133,26 +138,67 @@ struct CompanionPanelView: View {
     // MARK: - Sign In
 
     private var isSignInInputIncomplete: Bool {
-        serverAddressInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || accessCodeInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        switch selectedSignInMode {
+        case .clickyServer:
+            return serverAddressInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || accessCodeInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .ownAPIKeys:
+            // Only Anthropic is required; the rest have built-in fallbacks
+            return anthropicAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
     }
 
-    private func signInTextField(placeholder: String, text: Binding<String>) -> some View {
-        TextField(placeholder, text: text)
-            .textFieldStyle(.plain)
-            .font(.system(size: 13, design: .monospaced))
-            .foregroundColor(DS.Colors.textPrimary)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(
-                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
-                    .fill(Color.white.opacity(0.08))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
-                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-            )
-            .onSubmit { submitAccessCode() }
+    /// Text fields share one look. Secret values use a SecureField so API
+    /// keys aren't readable over someone's shoulder.
+    private func signInTextField(placeholder: String, text: Binding<String>, isSecret: Bool = false) -> some View {
+        Group {
+            if isSecret {
+                SecureField(placeholder, text: text)
+            } else {
+                TextField(placeholder, text: text)
+            }
+        }
+        .textFieldStyle(.plain)
+        .font(.system(size: 13, design: .monospaced))
+        .foregroundColor(DS.Colors.textPrimary)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .fill(Color.white.opacity(0.08))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+        )
+        .onSubmit { submitSignIn() }
+    }
+
+    private func signInFieldLabel(_ label: String) -> some View {
+        Text(label)
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundColor(DS.Colors.textTertiary)
+            .padding(.top, 2)
+    }
+
+    private func signInModeButton(label: String, signInMode: ClickyConnectionMode) -> some View {
+        let isSelected = selectedSignInMode == signInMode
+        return Button(action: {
+            selectedSignInMode = signInMode
+            signInErrorMessage = nil
+        }) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(isSelected ? Color.white.opacity(0.1) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
     }
 
     private var signInSection: some View {
@@ -161,13 +207,45 @@ struct CompanionPanelView: View {
                 .font(.system(size: 12, weight: .bold))
                 .foregroundColor(DS.Colors.textSecondary)
 
-            Text("Enter the server address and personal access code you were given.")
-                .font(.system(size: 11))
-                .foregroundColor(DS.Colors.textTertiary)
-                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 0) {
+                signInModeButton(label: "Clicky server", signInMode: .clickyServer)
+                signInModeButton(label: "My own API keys", signInMode: .ownAPIKeys)
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.white.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+            )
 
-            signInTextField(placeholder: "clicky-proxy.example.workers.dev", text: $serverAddressInput)
-            signInTextField(placeholder: "CLK-XXXXX-XXXXX-XXXXX-XXXXX", text: $accessCodeInput)
+            switch selectedSignInMode {
+            case .clickyServer:
+                Text("Enter the server address and personal access code you were given.")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                signInTextField(placeholder: "clicky-proxy.example.workers.dev", text: $serverAddressInput)
+                signInTextField(placeholder: "CLK-XXXXX-XXXXX-XXXXX-XXXXX", text: $accessCodeInput)
+
+            case .ownAPIKeys:
+                Text("Use your own accounts. Keys stay in this Mac's Keychain and go only to each provider. Only Anthropic is required.")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                signInFieldLabel("ANTHROPIC API KEY")
+                signInTextField(placeholder: "sk-ant-…", text: $anthropicAPIKeyInput, isSecret: true)
+
+                signInFieldLabel("ASSEMBLYAI API KEY (OPTIONAL, ELSE APPLE SPEECH)")
+                signInTextField(placeholder: "Leave empty to use Apple speech recognition", text: $assemblyAIAPIKeyInput, isSecret: true)
+
+                signInFieldLabel("ELEVENLABS (OPTIONAL, ELSE MACOS VOICE)")
+                signInTextField(placeholder: "ElevenLabs API key", text: $elevenLabsAPIKeyInput, isSecret: true)
+                signInTextField(placeholder: "ElevenLabs voice ID", text: $elevenLabsVoiceIDInput)
+            }
 
             if let signInErrorMessage {
                 Text(signInErrorMessage)
@@ -177,52 +255,75 @@ struct CompanionPanelView: View {
             }
 
             Button(action: {
-                submitAccessCode()
+                submitSignIn()
             }) {
-                Text(isCheckingAccessCode ? "Checking…" : "Sign In")
+                Text(isCheckingSignIn ? "Checking…" : "Sign In")
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundColor(DS.Colors.textOnAccent)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
                     .background(
                         RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
-                            .fill(isSignInInputIncomplete || isCheckingAccessCode
+                            .fill(isSignInInputIncomplete || isCheckingSignIn
                                   ? DS.Colors.accent.opacity(0.4)
                                   : DS.Colors.accent)
                     )
             }
             .buttonStyle(.plain)
             .pointerCursor()
-            .disabled(isSignInInputIncomplete || isCheckingAccessCode)
+            .disabled(isSignInInputIncomplete || isCheckingSignIn)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func submitAccessCode() {
-        guard !isSignInInputIncomplete, !isCheckingAccessCode else { return }
-        isCheckingAccessCode = true
+    private func submitSignIn() {
+        guard !isSignInInputIncomplete, !isCheckingSignIn else { return }
+        isCheckingSignIn = true
         signInErrorMessage = nil
 
         Task { @MainActor in
-            let signInErrorMessageFromWorker = await companionManager.signIn(
-                withServerAddress: serverAddressInput,
-                accessCode: accessCodeInput
-            )
-            isCheckingAccessCode = false
-            signInErrorMessage = signInErrorMessageFromWorker
-            if signInErrorMessageFromWorker == nil {
+            let signInErrorMessageFromCheck: String?
+            switch selectedSignInMode {
+            case .clickyServer:
+                signInErrorMessageFromCheck = await companionManager.signIn(
+                    withServerAddress: serverAddressInput,
+                    accessCode: accessCodeInput
+                )
+            case .ownAPIKeys:
+                signInErrorMessageFromCheck = await companionManager.signInWithOwnAPIKeys(
+                    anthropicAPIKey: anthropicAPIKeyInput,
+                    assemblyAIAPIKey: assemblyAIAPIKeyInput,
+                    elevenLabsAPIKey: elevenLabsAPIKeyInput,
+                    elevenLabsVoiceID: elevenLabsVoiceIDInput
+                )
+            }
+
+            isCheckingSignIn = false
+            signInErrorMessage = signInErrorMessageFromCheck
+            if signInErrorMessageFromCheck == nil {
+                // Don't keep secrets in view state once they're in the Keychain
                 accessCodeInput = ""
+                anthropicAPIKeyInput = ""
+                assemblyAIAPIKeyInput = ""
+                elevenLabsAPIKeyInput = ""
             }
         }
     }
 
+    private var signedInAccountDescription: String {
+        if companionManager.isSignedInWithOwnAPIKeys {
+            return "Using your own API keys"
+        }
+        return "Signed in as \(companionManager.signedInUserName?.capitalized ?? "")"
+    }
+
     private var signedInAccountRow: some View {
         HStack(spacing: 6) {
-            Image(systemName: "person.crop.circle")
+            Image(systemName: companionManager.isSignedInWithOwnAPIKeys ? "key" : "person.crop.circle")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(DS.Colors.textTertiary)
 
-            Text("Signed in as \(companionManager.signedInUserName?.capitalized ?? "")")
+            Text(signedInAccountDescription)
                 .font(.system(size: 11))
                 .foregroundColor(DS.Colors.textTertiary)
 

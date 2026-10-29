@@ -11,7 +11,7 @@ Clicky.app ──(access code)──▶ Cloudflare Worker ──(your API keys)�
 ```
 
 - **The server** (`worker/`) is a small Cloudflare Worker that holds the API keys. Whoever runs it pays for usage.
-- **The app** never contains keys or server details. People sign in with a server address and a personal access code.
+- **The app** never contains keys or server details. People sign in with a server address and a personal access code, or with their own API keys.
 - **Access codes** are per person, with an optional daily limit and model allowlist, and can be revoked at any time.
 
 ## If you're running the server
@@ -47,7 +47,12 @@ Send each person their access code and your server address. Set a monthly spend 
 
 ## If you're using the app
 
-Open Clicky from the menu bar, enter the server address and access code you were given, grant the permissions it asks for, and hold **Control + Option** to talk.
+Open Clicky from the menu bar and sign in one of two ways:
+
+- **Clicky server**: the server address and access code you were given.
+- **My own API keys**: paste your own keys; nobody else's server is involved. Only an Anthropic key is required. Without AssemblyAI, Apple's speech recognition is used; without ElevenLabs, the built-in macOS voice speaks.
+
+Grant the permissions it asks for, then hold **Control + Option** to talk.
 
 ## Building the app
 

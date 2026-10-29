@@ -17,13 +17,6 @@ struct AssemblyAIStreamingTranscriptionProviderError: LocalizedError {
 }
 
 final class AssemblyAIStreamingTranscriptionProvider: BuddyTranscriptionProvider {
-    /// URL for the Cloudflare Worker endpoint that returns a short-lived
-    /// AssemblyAI streaming token. The real API key never leaves the server.
-    // Computed, not stored, because the server address is set at sign-in
-    private static var tokenProxyURL: String {
-        "\(ClickyWorkerConnection.workerBaseURL)/transcribe-token"
-    }
-
     let displayName = "AssemblyAI"
     let requiresSpeechRecognitionPermission = false
 
@@ -60,11 +53,10 @@ final class AssemblyAIStreamingTranscriptionProvider: BuddyTranscriptionProvider
         return session
     }
 
-    /// Calls the Cloudflare Worker to get a short-lived AssemblyAI token.
+    /// Gets a short-lived AssemblyAI token so the websocket never sees a long-lived key.
     private func fetchTemporaryToken() async throws -> String {
-        var request = URLRequest(url: URL(string: Self.tokenProxyURL)!)
-        request.httpMethod = "POST"
-        ClickyWorkerConnection.addAccessCodeAuthorization(to: &request)
+        // From the Clicky server, or straight from AssemblyAI with the person's own key
+        let request = ClickyServiceConnection.makeTranscriptionTokenRequest()
 
         let (data, response) = try await URLSession.shared.data(for: request)
 

@@ -57,7 +57,10 @@ enum BuddyTranscriptionProviderFactory {
 
         if preferredProvider == .assemblyAI {
             if assemblyAIProvider.isConfigured {
-                return assemblyAIProvider
+                return ClickyConnectionAwareTranscriptionProvider(
+                    assemblyAIProvider: assemblyAIProvider,
+                    appleSpeechProvider: AppleSpeechTranscriptionProvider()
+                )
             }
 
             print("⚠️ Transcription: AssemblyAI preferred but not configured, falling back")
@@ -96,5 +99,46 @@ enum BuddyTranscriptionProviderFactory {
         }
 
         return AppleSpeechTranscriptionProvider()
+    }
+}
+
+/// Picks AssemblyAI or Apple Speech at the start of each push-to-talk, so
+/// signing in with own API keys but no AssemblyAI key still works (Apple's
+/// recogniser runs on-device). The choice can change while the app runs,
+/// because the dictation manager creates its provider once at launch,
+/// before anyone has signed in.
+final class ClickyConnectionAwareTranscriptionProvider: BuddyTranscriptionProvider {
+    private let assemblyAIProvider: AssemblyAIStreamingTranscriptionProvider
+    private let appleSpeechProvider: AppleSpeechTranscriptionProvider
+
+    init(
+        assemblyAIProvider: AssemblyAIStreamingTranscriptionProvider,
+        appleSpeechProvider: AppleSpeechTranscriptionProvider
+    ) {
+        self.assemblyAIProvider = assemblyAIProvider
+        self.appleSpeechProvider = appleSpeechProvider
+    }
+
+    private var currentProvider: any BuddyTranscriptionProvider {
+        ClickyServiceConnection.isAssemblyAITranscriptionAvailable ? assemblyAIProvider : appleSpeechProvider
+    }
+
+    var displayName: String { currentProvider.displayName }
+    var requiresSpeechRecognitionPermission: Bool { currentProvider.requiresSpeechRecognitionPermission }
+    var isConfigured: Bool { currentProvider.isConfigured }
+    var unavailableExplanation: String? { currentProvider.unavailableExplanation }
+
+    func startStreamingSession(
+        keyterms: [String],
+        onTranscriptUpdate: @escaping (String) -> Void,
+        onFinalTranscriptReady: @escaping (String) -> Void,
+        onError: @escaping (Error) -> Void
+    ) async throws -> any BuddyStreamingTranscriptionSession {
+        try await currentProvider.startStreamingSession(
+            keyterms: keyterms,
+            onTranscriptUpdate: onTranscriptUpdate,
+            onFinalTranscriptReady: onFinalTranscriptReady,
+            onError: onError
+        )
     }
 }

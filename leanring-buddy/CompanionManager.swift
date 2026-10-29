@@ -55,11 +55,11 @@ final class CompanionManager: ObservableObject {
     // streamingResponseText, so no separate response overlay manager is needed.
 
     private lazy var claudeAPI: ClaudeAPI = {
-        return ClaudeAPI(proxyURL: "\(ClickyWorkerConnection.workerBaseURL)/chat", model: selectedModel)
+        return ClaudeAPI(proxyURL: ClickyServiceConnection.chatRequestURL, model: selectedModel)
     }()
 
     private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
-        return ElevenLabsTTSClient(proxyURL: "\(ClickyWorkerConnection.workerBaseURL)/tts")
+        return ElevenLabsTTSClient()
     }()
 
     /// Conversation history so Claude remembers prior exchanges within a session.
@@ -131,13 +131,19 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Sign-In (personal access codes)
 
-    /// Who the Worker says the stored access code belongs to. nil means
-    /// signed out. Cached in UserDefaults so the panel shows the right state
-    /// instantly on launch; the code itself lives in the Keychain.
+    /// Who the Clicky server says the stored access code belongs to. nil
+    /// when signed out or using own API keys. Cached in UserDefaults so the
+    /// panel shows the right state instantly on launch; the code itself
+    /// lives in the Keychain.
     @Published private(set) var signedInUserName: String? = UserDefaults.standard.string(forKey: "signedInUserName")
 
+    /// True when the person signed in by pasting their own API keys instead
+    /// of using a Clicky server.
+    @Published private(set) var isSignedInWithOwnAPIKeys: Bool =
+        ClickyServiceConnection.connectionMode == .ownAPIKeys && ClickyKeychainStore.read(.anthropicAPIKey) != nil
+
     var isSignedIn: Bool {
-        signedInUserName != nil
+        signedInUserName != nil || isSignedInWithOwnAPIKeys
     }
 
     /// Claude model IDs the server allows for this person (e.g. Sonnet only
@@ -185,7 +191,7 @@ final class CompanionManager: ObservableObject {
     /// Checks the code with the given server and stores both if valid.
     /// Returns a message to show on the sign-in screen, or nil on success.
     func signIn(withServerAddress enteredServerAddress: String, accessCode enteredAccessCode: String) async -> String? {
-        guard let serverAddress = ClickyWorkerConnection.normalizedServerAddress(from: enteredServerAddress) else {
+        guard let serverAddress = ClickyServiceConnection.normalizedServerAddress(from: enteredServerAddress) else {
             return "Enter the server address you were given, like https://clicky-proxy.example.workers.dev"
         }
 
@@ -197,9 +203,13 @@ final class CompanionManager: ObservableObject {
 
         switch await verifyAccessCodeWithWorker(serverAddress: serverAddress, accessCode: accessCode) {
         case .valid(let userName, let allowedModelIDs):
-            ClickyWorkerConnection.saveServerAddress(serverAddress)
-            ClickyAccessCodeKeychainStore.saveAccessCode(accessCode)
-            rebuildWorkerClientsForCurrentServerAddress()
+            // Switching from own keys to a server shouldn't leave those keys behind
+            ClickyKeychainStore.deleteAllCredentials()
+            ClickyKeychainStore.save(accessCode, as: .clickyServerAccessCode)
+            ClickyServiceConnection.saveConnectionMode(.clickyServer)
+            ClickyServiceConnection.saveServerAddress(serverAddress)
+            rebuildClientsForCurrentConnection()
+            isSignedInWithOwnAPIKeys = false
             setSignedInUserName(userName)
             setAllowedModelIDsForSignedInUser(allowedModelIDs)
             return nil
@@ -210,8 +220,89 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    private enum AnthropicAPIKeyVerificationResult {
+        case valid
+        case rejected
+        case anthropicUnreachable(reason: String)
+    }
+
+    /// Lists models with the key: the cheapest call that proves the key
+    /// works without spending any tokens.
+    private func verifyAnthropicAPIKey(_ anthropicAPIKey: String) async -> AnthropicAPIKeyVerificationResult {
+        var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/models")!)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 15
+        request.setValue(anthropicAPIKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+            switch statusCode {
+            case 200:
+                return .valid
+            case 401, 403:
+                return .rejected
+            default:
+                return .anthropicUnreachable(reason: "Anthropic answered with HTTP \(statusCode). Try again in a moment.")
+            }
+        } catch {
+            return .anthropicUnreachable(reason: "Couldn't reach Anthropic. Check your internet connection.")
+        }
+    }
+
+    /// Signs in with the person's own API keys. Only Anthropic is required:
+    /// without AssemblyAI, Apple's speech recogniser is used, and without
+    /// ElevenLabs the macOS voice speaks. Returns a message to show on the
+    /// sign-in screen, or nil on success.
+    func signInWithOwnAPIKeys(
+        anthropicAPIKey enteredAnthropicAPIKey: String,
+        assemblyAIAPIKey enteredAssemblyAIAPIKey: String,
+        elevenLabsAPIKey enteredElevenLabsAPIKey: String,
+        elevenLabsVoiceID enteredElevenLabsVoiceID: String
+    ) async -> String? {
+        let anthropicAPIKey = enteredAnthropicAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let assemblyAIAPIKey = enteredAssemblyAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let elevenLabsAPIKey = enteredElevenLabsAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let elevenLabsVoiceID = enteredElevenLabsVoiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !anthropicAPIKey.isEmpty else {
+            return "An Anthropic API key is required."
+        }
+        // The ElevenLabs key is useless without a voice to speak with, and vice versa
+        guard elevenLabsAPIKey.isEmpty == elevenLabsVoiceID.isEmpty else {
+            return "For ElevenLabs, enter both the API key and a voice ID, or leave both empty to use the macOS voice."
+        }
+
+        switch await verifyAnthropicAPIKey(anthropicAPIKey) {
+        case .valid:
+            break
+        case .rejected:
+            return "Anthropic rejected that API key. Check it and try again."
+        case .anthropicUnreachable(let reason):
+            return reason
+        }
+
+        ClickyKeychainStore.deleteAllCredentials()
+        ClickyKeychainStore.save(anthropicAPIKey, as: .anthropicAPIKey)
+        ClickyKeychainStore.save(assemblyAIAPIKey, as: .assemblyAIAPIKey)
+        ClickyKeychainStore.save(elevenLabsAPIKey, as: .elevenLabsAPIKey)
+        ClickyServiceConnection.saveOwnElevenLabsVoiceID(elevenLabsVoiceID)
+        ClickyServiceConnection.saveConnectionMode(.ownAPIKeys)
+        rebuildClientsForCurrentConnection()
+
+        setSignedInUserName(nil)
+        // Own keys aren't limited to particular models
+        setAllowedModelIDsForSignedInUser(nil)
+        isSignedInWithOwnAPIKeys = true
+        return nil
+    }
+
+    /// Forgets every stored credential (access code and own API keys). The
+    /// server address is kept so signing back in only needs the code.
     func signOut() {
-        ClickyAccessCodeKeychainStore.deleteAccessCode()
+        ClickyKeychainStore.deleteAllCredentials()
+        isSignedInWithOwnAPIKeys = false
         setSignedInUserName(nil)
         setAllowedModelIDsForSignedInUser(nil)
         // A different person may sign in next, so don't carry over context.
@@ -234,19 +325,22 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// The Claude and TTS clients capture their URL when created, so they're
-    /// recreated whenever the server address changes at sign-in.
-    private func rebuildWorkerClientsForCurrentServerAddress() {
-        claudeAPI = ClaudeAPI(proxyURL: "\(ClickyWorkerConnection.workerBaseURL)/chat", model: selectedModel)
-        elevenLabsTTSClient = ElevenLabsTTSClient(proxyURL: "\(ClickyWorkerConnection.workerBaseURL)/tts")
+    /// The Claude client captures its URL when created, so the clients are
+    /// recreated whenever sign-in changes the server or connection mode.
+    private func rebuildClientsForCurrentConnection() {
+        claudeAPI = ClaudeAPI(proxyURL: ClickyServiceConnection.chatRequestURL, model: selectedModel)
+        elevenLabsTTSClient = ElevenLabsTTSClient()
     }
 
     /// Re-checks the stored code on launch so a code revoked with
     /// remove-user.mjs signs the person out. Being offline keeps them
     /// signed in; requests will just fail until the network is back.
     private func revalidateStoredAccessCode() {
-        guard let storedAccessCode = ClickyAccessCodeKeychainStore.readAccessCode(),
-              !ClickyWorkerConnection.workerBaseURL.isEmpty else {
+        // Own API keys have no server-side code to re-check
+        guard ClickyServiceConnection.connectionMode == .clickyServer else { return }
+
+        guard let storedAccessCode = ClickyKeychainStore.read(.clickyServerAccessCode),
+              !ClickyServiceConnection.workerBaseURL.isEmpty else {
             if isSignedIn {
                 setSignedInUserName(nil)
             }
@@ -254,7 +348,7 @@ final class CompanionManager: ObservableObject {
         }
 
         Task {
-            switch await verifyAccessCodeWithWorker(serverAddress: ClickyWorkerConnection.workerBaseURL, accessCode: storedAccessCode) {
+            switch await verifyAccessCodeWithWorker(serverAddress: ClickyServiceConnection.workerBaseURL, accessCode: storedAccessCode) {
             case .valid(let userName, let allowedModelIDs):
                 setSignedInUserName(userName)
                 setAllowedModelIDsForSignedInUser(allowedModelIDs)
@@ -773,12 +867,12 @@ final class CompanionManager: ObservableObject {
     /// NSSpeechSynthesizer so it works even when ElevenLabs is down.
     private func speakErrorFallback(for error: Error) {
         let utterance: String
-        if ClickyWorkerConnection.isInvalidAccessCodeError(error) {
+        if ClickyServiceConnection.isInvalidAccessCodeError(error) {
             signOut()
             utterance = "Your access code isn't valid anymore. Open Clicky from the menu bar to sign in again."
-        } else if ClickyWorkerConnection.isDailyLimitReachedError(error) {
+        } else if ClickyServiceConnection.isDailyLimitReachedError(error) {
             utterance = "You've reached today's Clicky limit. It resets tomorrow."
-        } else if ClickyWorkerConnection.isModelNotAllowedError(error) {
+        } else if ClickyServiceConnection.isModelNotAllowedError(error) {
             utterance = "That model isn't available on your account. Pick another one in the Clicky menu."
         } else {
             utterance = "Sorry, I couldn't reach my services. Check your API credits and internet connection, then try again."

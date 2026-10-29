@@ -41,7 +41,7 @@ class ClaudeAPI {
         request.httpMethod = "POST"
         request.timeoutInterval = 120
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        ClickyWorkerConnection.addAccessCodeAuthorization(to: &request)
+        ClickyServiceConnection.authorizeChatRequest(&request)
         return request
     }
 

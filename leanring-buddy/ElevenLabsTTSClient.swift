@@ -2,40 +2,46 @@
 //  ElevenLabsTTSClient.swift
 //  leanring-buddy
 //
-//  Streams text-to-speech audio from ElevenLabs and plays it back
-//  through the system audio output. Uses the streaming endpoint so
-//  playback begins before the full audio has been generated.
+//  Speaks Claude's replies. Uses ElevenLabs (through the Clicky server, or
+//  directly with the person's own key) and falls back to the built-in
+//  macOS voice when someone using their own keys hasn't added ElevenLabs.
 //
 
+import AppKit
 import AVFoundation
 import Foundation
 
 @MainActor
 final class ElevenLabsTTSClient {
-    private let proxyURL: URL
     private let session: URLSession
 
     /// The audio player for the current TTS playback. Kept alive so the
     /// audio finishes playing even if the caller doesn't hold a reference.
     private var audioPlayer: AVAudioPlayer?
 
-    init(proxyURL: String) {
-        self.proxyURL = URL(string: proxyURL)!
+    /// Used instead of ElevenLabs when it isn't configured in own-keys mode.
+    private let systemVoiceSynthesizer = NSSpeechSynthesizer()
 
+    init() {
         let configuration = URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 30
         configuration.timeoutIntervalForResource = 60
         self.session = URLSession(configuration: configuration)
     }
 
-    /// Sends `text` to ElevenLabs TTS and plays the resulting audio.
+    /// Speaks `text` and returns once playback has started.
     /// Throws on network or decoding errors. Cancellation-safe.
     func speakText(_ text: String) async throws {
-        var request = URLRequest(url: proxyURL)
+        guard ClickyServiceConnection.isElevenLabsSpeechAvailable else {
+            systemVoiceSynthesizer.startSpeaking(text)
+            print("🔊 System voice: speaking \(text.count) characters")
+            return
+        }
+
+        var request = ClickyServiceConnection.makeTextToSpeechRequest()
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("audio/mpeg", forHTTPHeaderField: "Accept")
-        ClickyWorkerConnection.addAccessCodeAuthorization(to: &request)
 
         let body: [String: Any] = [
             "text": text,
@@ -69,14 +75,15 @@ final class ElevenLabsTTSClient {
         print("🔊 ElevenLabs TTS: playing \(data.count / 1024)KB audio")
     }
 
-    /// Whether TTS audio is currently playing back.
+    /// Whether reply audio is currently playing back.
     var isPlaying: Bool {
-        audioPlayer?.isPlaying ?? false
+        (audioPlayer?.isPlaying ?? false) || systemVoiceSynthesizer.isSpeaking
     }
 
     /// Stops any in-progress playback immediately.
     func stopPlayback() {
         audioPlayer?.stop()
         audioPlayer = nil
+        systemVoiceSynthesizer.stopSpeaking()
     }
 }
