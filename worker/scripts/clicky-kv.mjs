@@ -25,12 +25,15 @@ export function putKvValue(key, value) {
 
 /** Returns the value, or null when the key doesn't exist. */
 export function getKvValue(key) {
-  // wrangler can print notices before the value, and reports a missing key
-  // as "Value not found" on stdout with exit code 0. Every value these
-  // scripts store is a single line, so the last line is the value.
+  // wrangler 4 fails with a 404 when reading a missing key, so check the key
+  // exists first (listing with the exact key as prefix) instead of parsing errors.
+  if (!listKvKeyNames(key).includes(key)) {
+    return null;
+  }
+  // wrangler can print notices before the value. Every value these scripts
+  // store is a single line, so the last line is the value.
   const getOutputLines = runWranglerKvCommand(["key", "get", key, "--text"]).split("\n");
-  const value = getOutputLines[getOutputLines.length - 1].trim();
-  return value === "Value not found" ? null : value;
+  return getOutputLines[getOutputLines.length - 1].trim();
 }
 
 export function deleteKvValue(key) {
