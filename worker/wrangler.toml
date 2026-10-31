@@ -4,7 +4,7 @@ compatibility_date = "2024-01-01"
 
 [vars]
 # Pick a voice in ElevenLabs → Voices and paste its Voice ID
-ELEVENLABS_VOICE_ID = "zfc8CJQpe8Kqyl0vvCzo"
+ELEVENLABS_VOICE_ID = "EST9Ui6982FZPSi7gCHi"
 
 # Personal access codes and daily usage counters. Create the namespace once with
 #   npx wrangler kv namespace create CLICKY_USERS
