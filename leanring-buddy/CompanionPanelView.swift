@@ -779,11 +779,11 @@ struct CompanionPanelView: View {
 
             // Only offer models the server allows for this person
             HStack(spacing: 0) {
-                if companionManager.isModelAllowedForSignedInUser("claude-sonnet-4-6") {
-                    modelOptionButton(label: "Sonnet", modelID: "claude-sonnet-4-6")
+                if companionManager.isModelAllowedForSignedInUser("claude-sonnet-5-5") {
+                    modelOptionButton(label: "Sonnet 5.5", modelID: "claude-sonnet-5-5")
                 }
-                if companionManager.isModelAllowedForSignedInUser("claude-opus-4-6") {
-                    modelOptionButton(label: "Opus", modelID: "claude-opus-4-6")
+                if companionManager.isModelAllowedForSignedInUser("claude-opus-5-5") {
+                    modelOptionButton(label: "Opus 5.5", modelID: "claude-opus-5-5")
                 }
             }
             .background(

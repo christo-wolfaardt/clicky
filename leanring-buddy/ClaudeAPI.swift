@@ -14,7 +14,7 @@ class ClaudeAPI {
     var model: String
     private let session: URLSession
 
-    init(proxyURL: String, model: String = "claude-sonnet-4-6") {
+    init(proxyURL: String, model: String = "claude-sonnet-5-5") {
         self.apiURL = URL(string: proxyURL)!
         self.model = model
 
@@ -140,12 +140,20 @@ class ClaudeAPI {
         ])
         messages.append(["role": "user", "content": contentBlocks])
 
+        // The 5.5 models think before answering and that thinking counts toward
+        // max_tokens, so leave plenty of room or spoken answers get cut off.
+        // Low effort keeps the wait short for voice. Web search lets Claude look
+        // things up instead of guessing; capped at 3 searches (about $0.01 each).
         let body: [String: Any] = [
             "model": model,
-            "max_tokens": 1024,
+            "max_tokens": 8000,
             "stream": true,
             "system": systemPrompt,
-            "messages": messages
+            "messages": messages,
+            "output_config": ["effort": "low"],
+            "tools": [
+                ["type": "web_search_20260209", "name": "web_search", "max_uses": 3]
+            ]
         ]
 
         let bodyData = try JSONSerialization.data(withJSONObject: body)
